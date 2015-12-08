@@ -9,6 +9,7 @@ from datetime import datetime
 import requests
 import rumps
 import simplejson
+from socketIO_client import SocketIO, ConnectionError, BaseNamespace
 
 VERSION = '0.3.1'
 APP_NAME = 'Nightscout Menubar'
@@ -16,10 +17,12 @@ PROJECT_HOMEPAGE = 'https://github.com/mddub/nightscout-osx-menubar'
 
 NIGHTSCOUT_URL = '/api/v1/entries.json?count=100'
 UPDATE_FREQUENCY_SECONDS = 20
+WS_UPDATE_FREQUENCY_SECONDS = 3
 MAX_SECONDS_TO_SHOW_DELTA = 600
 HISTORY_LENGTH = 5
 MAX_BAD_REQUEST_ATTEMPTS = 3
 REQUEST_TIMEOUT_SECONDS = 2
+WEBSOCKET_STATUS_CONNECTED = "Connected"
 
 ################################################################################
 # Display options
@@ -44,6 +47,7 @@ class NightscoutConfig(object):
     SECTION = 'NightscoutMenubar'
     HOST = 'nightscout_host'
     USE_MMOL = 'use_mmol'
+    USE_WEBSOCKET = 'use_websocket'
 
     def __init__(self, app_name):
         self.config_path = os.path.join(rumps.application_support(app_name), self.FILENAME)
@@ -55,12 +59,22 @@ class NightscoutConfig(object):
             self.set_host('')
         if not self.config.has_option(self.SECTION, self.USE_MMOL):
             self.set_use_mmol(False)
+        if not self.config.has_option(self.SECTION, self.USE_WEBSOCKET):
+            self.set_use_websocket(False)
 
     def get_host(self):
         return self.config.get(self.SECTION, self.HOST)
 
     def set_host(self, host):
         self.config.set(self.SECTION, self.HOST, host)
+        with open(self.config_path, 'w') as f:
+            self.config.write(f)
+
+    def get_use_websocket(self):
+        return bool(self.config.get(self.SECTION, self.USE_WEBSOCKET))
+
+    def set_use_websocket(self, websocket):
+        self.config.set(self.SECTION, self.USE_WEBSOCKET, 'true' if websocket else '')
         with open(self.config_path, 'w') as f:
             self.config.write(f)
 
@@ -93,6 +107,10 @@ def post_history_menu_options():
     mgdl.state = not config.get_use_mmol()
     mmol = rumps.MenuItem('mmol/L', callback=choose_units_mmol)
     mmol.state = config.get_use_mmol()
+    rest = rumps.MenuItem('rest', callback=choose_rest)
+    rest.state = not config.get_use_websocket()
+    websocket = rumps.MenuItem('websocket', callback=choose_websocket)
+    websocket.state = config.get_use_websocket()
     items = [
         None,
         [
@@ -100,6 +118,9 @@ def post_history_menu_options():
             [
                 mgdl,
                 mmol,
+                None,
+                rest,
+                websocket,
                 None,
                 rumps.MenuItem('Set Nightscout URL...', callback=configuration_window),
                 rumps.MenuItem('Help...', callback=open_project_homepage),
@@ -182,7 +203,7 @@ def get_menubar_text(entries):
         time_ago=time_ago(seconds_ago(last['date'])),
     )
 
-def get_history_menu_items(entries):
+def get_history_menu_items(entries, start = 1):
     bgs = filter_bgs(entries)
     return [
         MENU_ITEM_TEXT.format(
@@ -192,21 +213,80 @@ def get_history_menu_items(entries):
             time_ago=time_ago(seconds_ago(e['date'])),
         )
         for i, e in enumerate(bgs)
-    ][1:HISTORY_LENGTH + 1]
+    ][start:HISTORY_LENGTH + 1]
+
+websocket_entries = []
+websocket_status = "Connecting"
+socketIoClient = None
+
+class NightscoutNamespace(BaseNamespace):
+    def on_dataUpdate(self, *args):
+        for arg in args:
+            if type(arg) == dict:
+                print arg.keys()
+                global websocket_entries
+                for entry in arg.get('sgvs', ()):
+                    entry['date'] = entry['mills']
+                    entry['sgv'] = entry['mgdl']
+                    websocket_entries.append(entry)
+                websocket_entries = sorted(websocket_entries, key=lambda k: k['date'], reverse=True)
+        update_data(None)
+
+    def on_error(self, *args):
+        global websocket_status, socketIoClient
+        print "error", repr(args)
+
+        websocket_status = "Error: %s" % repr(args)
+        socketIoClient = None
+
+    def on_connect(self, *args):
+        global websocket_status
+        print "connected", repr(args)
+        websocket_status = WEBSOCKET_STATUS_CONNECTED
+        socketIoClient.wait_for_callbacks(1)
+
+    def on_disconnect(self, *args):
+        global websocket_status, socketIoClient
+        print "disconnected", repr(args)
+        websocket_status = "Disconnected"
+        socketIoClient = None
+
+
+@rumps.timer(WS_UPDATE_FREQUENCY_SECONDS)
+def service_websocket(sender):
+    global socketIoClient, websocket_status
+    try:
+        if socketIoClient is None:
+            socketIoClient = SocketIO(config.get_host(), wait_for_connection=False,
+                                      verify=False, Namespace=NightscoutNamespace)
+            websocket_status = "Connecting"
+            update_menu("<Connecting to Nightscout...>", [])
+        else:
+            socketIoClient.wait(0.05)
+            socketIoClient.wait_for_callbacks(0.05)
+    except ConnectionError, e:
+        websocket_status = "<Disconnected>"
+        update_menu(websocket_status, [str(e.message)[:100]])
+        socketIoClient = None
 
 @rumps.timer(UPDATE_FREQUENCY_SECONDS)
 def update_data(sender):
     entries = None
     try:
         try:
-            entries = get_entries()
+            if config.get_use_websocket():
+                if websocket_status != WEBSOCKET_STATUS_CONNECTED:
+                    update_menu(websocket_status, get_history_menu_items(websocket_entries, start=0))
+                else:
+                    update_menu(get_menubar_text(websocket_entries), get_history_menu_items(websocket_entries))
+            else:
+                entries = get_entries()
+                update_menu(get_menubar_text(entries), get_history_menu_items(entries))
         except NightscoutException, e:
             if config.get_host():
                 update_menu("<Can't connect to Nightscout!>", [e.message[:100]])
             else:
                 update_menu("<Set Nightscout URL!>", [])
-        else:
-            update_menu(get_menubar_text(entries), get_history_menu_items(entries))
     except Exception, e:
         print "Nightscout data: " + simplejson.dumps(entries)
         print repr(e)
@@ -236,6 +316,14 @@ def choose_units_mgdl(sender):
 
 def choose_units_mmol(sender):
     config.set_use_mmol(True)
+    update_data(None)
+
+def choose_websocket(sender):
+    config.set_use_websocket(True)
+    update_data(None)
+
+def choose_rest(sender):
+    config.set_use_websocket(False)
     update_data(None)
 
 if __name__ == "__main__":
